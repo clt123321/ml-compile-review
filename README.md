@@ -1,0 +1,52 @@
+# ml-compile-review
+
+> 机器学习编译 (ML Compilation) 与推理加速的个人学习/复习/面试笔记合集
+>
+> 从 voice_safety P2.5 生产项目实战整理而来, 之后逐步扩充相关主题。
+
+## 为什么建这个仓
+
+- 机器学习编译 (MLC/ML compilation) 是最近几年跨 "深度学习框架 × 编译器 × 硬件" 三个领域的融合方向, 涉及 IR 设计、图优化、算子融合、内核生成、量化、硬件后端等大量概念, 需要**系统化整理**才能形成体系。
+- 生产项目里踩过的坑 (TRT 8.6 → 10.7 动态 shape bug、CUDA/cuDNN/ORT 版本矩阵、量化精度对齐等) **值得沉淀**, 便于面试复述 + 后续同类项目复用。
+- 相较于零散的知乎/博客文章, 本仓追求**互相印证**: 每个理论点尽量绑定实战 case (数据/日志/代码路径), 反之每个 case 都上溯到理论根因。
+
+## 当前收录
+
+| 文档 | 内容概要 | 行数 |
+|---|---|---|
+| [`ml_inference_acceleration.md`](./ml_inference_acceleration.md) | 推理加速完整手册: 加速金字塔 5 层 · 图优化 L1-L6 · 6 大推理框架矩阵 · 量化家族 · LLM 专属优化 · 硬件视角 · 多卡并行 · 性能分析 · 面试题清单 · voice_safety 实战 | 1258 |
+
+### `ml_inference_acceleration.md` 章节速览
+
+1. **全景**: 训练 vs 推理为何要单独加速, 推理场景的核心指标 (延迟/吞吐/成本三角)
+2. **加速五个层级**: 硬件 → 算子 → 图 → 框架 → 服务化融合 (金字塔模型)
+3. **图优化 L1-L6**: 常量折叠 → 算子融合 → 布局优化 → 内存重用 → 精度混合 → 并行调度
+4. **主流推理框架矩阵**: TensorRT / ONNX Runtime / TorchScript / XLA / TVM / vLLM / TGI 横向对比
+5. **模型类型 × 推理方案选型**: encoder-only / decoder-only / encoder-decoder 各自的加速路径
+6. **量化技术家族**: PTQ / QAT / SmoothQuant / GPTQ / AWQ / KV-Cache 量化
+7. **LLM 推理专属优化**: KV-Cache / PagedAttention / Continuous Batching / Speculative Decoding / MoE 稀疏化
+8. **硬件视角**: NVIDIA GPU 代际差异 / TPU / IPU / 国产芯片 (Habana/寒武纪/华为昇腾)
+9. **多卡并行推理**: TP / PP / EP / DP 组合策略
+10. **性能分析实战**: Nsight / nvprof / TensorBoard / PyTorch Profiler 使用要点
+11. **常见坑与踩雷**: 版本矩阵地狱 / TRT dynamic shape bug / 精度对齐陷阱
+12. **面试高频问题清单**: 60+ 题, 从概念到实战
+13. **实战案例**: voice_safety P2.5 从 ORT 1.13.1 CUDA EP → ORT 1.20 TRT 10.7 dynamic shape 的完整旅程
+
+## 未来补充计划
+
+- [ ] TVM / MLIR / IREE 三家开源 MLC 编译器深入对比
+- [ ] Triton (OpenAI) 与 CUDA/CUTLASS 的关系
+- [ ] Speculative Decoding 主流实现 (Medusa / EAGLE / Lookahead) 深挖
+- [ ] Quantization-Aware Training 完整 pipeline (以 LLM 为例)
+- [ ] 服务化框架深挖 (vLLM PagedAttention 源码走读 / TGI 架构)
+- [ ] 国产 AI 芯片编译栈调研 (华为 CANN / 寒武纪 Neuware / 昇思 MindSpore Lite)
+
+## 使用方式
+
+- 面试前顺一遍 §12 面试题, 遇到不熟就跳回对应 Part 补
+- 生产项目遇到具体优化, 从 §5 选型开始, 落到 §3 图优化找具体技术
+- 版本冲突/踩坑时, 优先看 §11 有无对应条目, 再看 §13 实战案例
+
+## License
+
+个人学习笔记, MIT.
