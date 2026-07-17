@@ -14,7 +14,7 @@
 
 | 文档 | 内容概要 | 行数 |
 |---|---|---|
-| [`ml_inference_acceleration.md`](./ml_inference_acceleration.md) | 推理加速完整手册: 加速金字塔 5 层 · 图优化 L1-L6 · 6 大推理框架矩阵 · 量化家族 · LLM 专属优化 · 硬件视角 · 多卡并行 · 性能分析 · 面试题清单 · voice_safety 实战 | 1258 |
+| [`ml_inference_acceleration.md`](./ml_inference_acceleration.md) | 推理加速完整手册: 加速金字塔 5 层 · 图优化 L1-L6 · 6 大推理框架矩阵 · 量化家族 · LLM 专属优化 · **前沿探索 (P/D 分离 · MTP · EAGLE-3 · FlashInfer · Sampling 重构)** · 硬件视角 · 多卡并行 · 性能分析 · 面试题清单 · voice_safety 实战 | 1710 |
 
 ### `ml_inference_acceleration.md` 章节速览
 
@@ -25,27 +25,35 @@
 5. **模型类型 × 推理方案选型**: encoder-only / decoder-only / encoder-decoder 各自的加速路径
 6. **量化技术家族**: PTQ / QAT / SmoothQuant / GPTQ / AWQ / KV-Cache 量化
 7. **LLM 推理专属优化**: KV-Cache / PagedAttention / Continuous Batching / Speculative Decoding / MoE 稀疏化
-8. **硬件视角**: NVIDIA GPU 代际差异 / TPU / IPU / 国产芯片 (Habana/寒武纪/华为昇腾)
-9. **多卡并行推理**: TP / PP / EP / DP 组合策略
-10. **性能分析实战**: Nsight / nvprof / TensorBoard / PyTorch Profiler 使用要点
-11. **常见坑与踩雷**: 版本矩阵地狱 / TRT dynamic shape bug / 精度对齐陷阱
-12. **面试高频问题清单**: 60+ 题, 从概念到实战
-13. **实战案例**: voice_safety P2.5 从 ORT 1.13.1 CUDA EP → ORT 1.20 TRT 10.7 dynamic shape 的完整旅程
+8. **前沿探索 (2025-2026)** 🆕: P/D 分离 (DistServe/Splitwise/Mooncake) · MTP (DeepSeek-V3 模型自带推测解码) · EAGLE 三代演进 · FlashInfer (MLSys'25 Best Paper) · Sampling 算子重构 (sorting-free) · MLA · RadixAttention · FP4/Blackwell · 长上下文优化
+9. **硬件视角**: NVIDIA GPU 代际差异 / TPU / IPU / 国产芯片 (Habana/寒武纪/华为昇腾)
+10. **多卡并行推理**: TP / PP / EP / DP 组合策略
+11. **性能分析实战**: Nsight / nvprof / TensorBoard / PyTorch Profiler 使用要点
+12. **常见坑与踩雷**: 版本矩阵地狱 / TRT dynamic shape bug / 精度对齐陷阱
+13. **面试高频问题清单**: 60+ 题, 从概念到实战
+14. **实战案例**: voice_safety P2.5 从 ORT 1.13.1 CUDA EP → ORT 1.20 TRT 10.7 dynamic shape 的完整旅程
 
 ## 未来补充计划
 
 - [ ] TVM / MLIR / IREE 三家开源 MLC 编译器深入对比
 - [ ] Triton (OpenAI) 与 CUDA/CUTLASS 的关系
-- [ ] Speculative Decoding 主流实现 (Medusa / EAGLE / Lookahead) 深挖
+- [x] ~~Speculative Decoding 主流实现深挖~~ → 已在 Part 8 追加 EAGLE-1/2/3 演进 + MTP + Medusa 对比
 - [ ] Quantization-Aware Training 完整 pipeline (以 LLM 为例)
 - [ ] 服务化框架深挖 (vLLM PagedAttention 源码走读 / TGI 架构)
+- [ ] Mooncake KV cache 池化协议深度拆解 (P/D 分离下 KV 传输的工程细节)
 - [ ] 国产 AI 芯片编译栈调研 (华为 CANN / 寒武纪 Neuware / 昇思 MindSpore Lite)
 
 ## 使用方式
 
-- 面试前顺一遍 §12 面试题, 遇到不熟就跳回对应 Part 补
+- 面试前顺一遍 §13 面试题, 遇到不熟就跳回对应 Part 补
 - 生产项目遇到具体优化, 从 §5 选型开始, 落到 §3 图优化找具体技术
-- 版本冲突/踩坑时, 优先看 §11 有无对应条目, 再看 §13 实战案例
+- 版本冲突/踩坑时, 优先看 §12 有无对应条目, 再看 §14 实战案例
+- **关注业界前沿** (2025-2026 SOTA 追新): 直接看 §8, 每次论文/框架发布后同步更新
+
+## 版本历史
+
+- **v1.1** (2026-07-15): 新增 Part 8 前沿探索 —— P/D 分离、MTP、EAGLE-3、FlashInfer、Sampling 重构
+- **v1.0** (2026-07-15): 初始版本，Part 1-13 完整手册（现 Part 1-7 + Part 9-14）
 
 ## License
 
