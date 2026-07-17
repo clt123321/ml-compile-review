@@ -747,451 +747,806 @@ Step 2: Large model (70B) 一次前向:
 
 ## Part 8. 前沿探索（2025-2026）
 
-> **文档时间戳**：2026-07-15 快照。本章追踪 2024 年以来 LLM 推理领域最重要的**架构级 / 算法级 / 算子级**演进，与 Part 7 的成熟优化互补。
->
-> **阅读姿势**：这些技术**都还在快速迭代**，具体数字（加速倍数、接受率）以论文和框架 release notes 为准，本章给出的是 2026-07 之前的公开数据。生产选型时**优先看框架是否已集成**（vLLM / SGLang / TRT-LLM），而非纸面数字。
+> **时间戳**：2026-07-15 快照。本章记录 2024 年以来已进入生产的 LLM 推理关键技术。所有数字均来自论文原文、官方 blog 或框架 release notes。
 
-### 8.1 全景：LLM 推理这一年半发生了什么
+### 8.1 P/D 分离（Prefill/Decode Disaggregation）
 
-以 2023 年底 vLLM 的 PagedAttention 为分水岭，LLM 推理从"单机单卡优化"跨入**系统架构级重构**阶段。过去 18 个月三条主线：
+#### 原理
 
-```
-主线 1: 架构级 —— P/D 分离 (Disaggregated Serving)
-  DistServe (2024-01, OSDI'24)
-    → Splitwise (2024-04, Microsoft ISCA'24)
-    → Mooncake (2024-06, Moonshot Kimi 生产)
-    → vLLM / SGLang / TRT-LLM / LMDeploy 全面支持 (2025)
-
-主线 2: 算法级 —— 推测解码进化 (外挂 draft → 模型内生)
-  EAGLE-1 (2024-01, feature-level speculative)
-    → EAGLE-2 (2024-06, 动态 draft tree)
-    → MTP (2024-12, DeepSeek-V3 模型自带 MTP heads)
-    → EAGLE-3 (2025-03, 直接 token 预测 + multi-layer fusion)
-
-主线 3: 算子级 —— Kernel 库范式
-  FlashAttention 3 (2024-07, H100 FP8 支持)
-    → FlashInfer (2025-01, MLSys'25 Best Paper, block-sparse + JIT)
-    → Sampling 算子重构 (2025-03, sorting-free)
-```
-
-**核心观察**：Part 7 讲的是"用现有工具优化"，Part 8 讲的是"业界重新定义了工具本身"。
-
-**技术选型转折点**：
-- 2023：单机 vLLM 就够用
-- 2025-2026：**生产大模型必须考虑 P/D 分离 + 推测解码 + FlashInfer kernel**，否则单卡吞吐落后同行 3-5x
-
-### 8.2 P/D 分离（Prefill/Decode Disaggregation）
-
-#### 8.2.1 问题背景
-
-Part 7.1 讲过 LLM 推理分 prefill (compute-bound) 和 decode (memory-bound) 两阶段。**传统方案两阶段跑在同一张 GPU 上**，产生两个问题：
+**Prefill vs Decode 的算术强度差异**（Part 7.1 结论）：
 
 ```
-问题 1: Prefill / Decode 互相干扰
-  当 GPU 正在跑长 prompt 的 prefill (占满 SM):
-     所有 decode 请求被阻塞
-     P99 latency 抖动严重
+Prefill:  N tokens 一次输入
+  Attention: O(N²) FLOPs, N² 大矩阵乘
+  FFN:       O(N)  FLOPs
+  Arithmetic Intensity ≈ 200 FLOPs/byte
+  → Compute-bound, TensorCore 打满
 
-问题 2: 资源配比无法独立优化
-  Prefill 需要: 高 FLOPS (compute-bound)
-  Decode 需要: 高 HBM 带宽 (memory-bound)
-  同一张卡兼顾, 两者都不最优
+Decode:   1 token 一次输入
+  Attention: O(1) FLOPs (与 KV cache 长度成正比的一维向量点积)
+  FFN:       O(1) FLOPs
+  Arithmetic Intensity ≈ 2 FLOPs/byte
+  → Memory-bound, HBM 带宽 bound
 ```
 
-#### 8.2.2 核心思想
-
-**用不同 GPU 集群分别处理 prefill 和 decode**，通过网络传输 KV cache 衔接两阶段。
+**Collocated 方案的干扰模型**：
 
 ```
-传统 collocated:                    P/D 分离:
-┌────────────────┐                  ┌──────────┐  ┌──────────┐
-│   GPU 0        │                  │  Prefill │  │  Decode  │
-│ ┌────────────┐ │                  │  Pool    │──│  Pool    │
-│ │ prefill req│ │                  │          │KV│          │
-│ │ decode req │ │                  │  A100    │→ │  H100    │
-│ └────────────┘ │                  │  (计算)  │  │  (带宽)  │
-└────────────────┘                  └──────────┘  └──────────┘
-    互相干扰                           独立扩缩容 + 硬件异构可行
+时间线 (同一 GPU 上):
+  t=0     Batch: [A_prefill(N=2048), B_decode, C_decode]
+  t=0     prefill A 占满 SM
+  t=100ms A 完成 → B/C 才能推进一步
+          期间 B/C 的 TPOT 全部 = 100ms (被 A 阻塞)
+          实际 B/C decode 一步只需 ~15ms
 ```
 
-#### 8.2.3 三代代表系统对比
-
-| 系统 | 时间 | 出品 | 关键创新 | 数字 |
-|---|---|---|---|---|
-| **DistServe** | 2024-01<br>OSDI'24 | 北大 + UCSD | 学术首发，两阶段独立 TP/PP 策略 + 拓扑感知放置 | Goodput **7.4x**<br>SLO 可紧缩 **12.6x** |
-| **Splitwise** | 2024-04<br>ISCA'24 | Microsoft | 异构 GPU（prefill 高算力 + decode 低成本） | 同资源吞吐 **2.35x**<br>或 20% 成本降 **1.4x** |
-| **Mooncake** | 2024-06<br>arXiv | Moonshot AI<br>（Kimi 生产） | **KV cache 中心化架构**：CPU DRAM + SSD 组池化 + 早期拒绝 | 长上下文吞吐 **+525%**<br>多处理 75% 请求 |
-
-**Mooncake 是当前生产标杆**（2025-2026 Kimi 亿级 DAU 在线跑），其核心创新是把 KV cache 提升为**一级公民**——不再是 GPU 内的临时 buffer，而是可以跨 GPU / CPU DRAM / SSD 分层存储、跨请求复用的持久化资源。
-
-#### 8.2.4 KV Cache 传输是关键工程点
-
-P/D 分离后，KV cache 必须从 prefill 节点跨 GPU 传到 decode 节点，这是新的瓶颈来源：
+**分离架构**：
 
 ```
-数量级估算 (Llama-70B, 4K prompt):
-  KV cache size = 4096 × 2.6 MB = 10 GB
-
-NVLink 900 GB/s:  10 GB / 900 = ~11 ms   (同机内, OK)
-IB 400 Gbps:      10 GB / 50 = ~200 ms   (跨机, 灾难)
-以太网 25 Gbps:   10 GB / 3.1 = ~3.2 s   (完全不可用)
-
-→ P/D 分离几乎必须 NVLink / IB, 或就近同机部署 prefill+decode 节点
-→ Mooncake 的 KV cache 池化实际上是"预加载到 SSD / DRAM 减少重复传输"
+                    ┌───────────────┐
+                    │  Prefill Pool │
+Request ──Router─→  │  · 独立 TP/PP │
+                    │  · compute 优化│
+                    └──────┬────────┘
+                           │ 传 KV cache
+                           ▼
+                    ┌───────────────┐
+                    │  Decode Pool  │
+                    │  · 独立 TP/PP │
+                    │  · 带宽优化   │
+                    └──────┬────────┘
+                           │
+                           ▼
+                         Response
 ```
 
-#### 8.2.5 生产落地状态（2026-07 快照）
+#### DistServe 的 TP/PP 选型公式（M/D/1 排队模型）
 
-| 框架 | P/D 分离支持 | 备注 |
-|---|---|---|
-| **vLLM** | ✅ (NixlConnector, 2025) | 生产可用 |
-| **SGLang** | ✅ | 深度整合 |
-| **TensorRT-LLM** | ✅ (Dynamo, NVIDIA 官方) | NVIDIA 主推 |
-| **LMDeploy** | ✅ v0.12 (DLSlime, Mooncake protocol) | 商汤 |
-| **DeepSeek 开源栈** | ✅ (自研) | DeepSeek-V3 生产 |
-
-**结论**：P/D 分离已从"论文技术"跨过"框架实验"进入"生产标配"，2026 年做 LLM serving 不上 P/D 就是落后。
-
-### 8.3 MTP（Multi-Token Prediction）—— 模型自带的推测解码
-
-#### 8.3.1 问题背景
-
-Part 7.5 的 speculative decoding 依赖**外挂的 draft model**（额外训一个小模型）。三个痛点：
-1. 需要额外训练 + 部署 draft model
-2. Draft 与 target 词汇 / 风格漂移，命中率不稳
-3. 长上下文时 draft 也吃显存
-
-**MTP 的解法**：让 target 模型**自己**输出多个未来 token 的预测——训练时 densify 监督信号，推理时直接白嫖 speculative decoding。
-
-#### 8.3.2 时间线：两条线交汇
+单实例平均 TTFT（服务时间 D，请求率 R）：
 
 ```
-2024-04: Meta "Better & Faster LLMs via Multi-token Prediction" (Gloeckle et al.)
-         → D 个独立 heads 并行预测 next-1, next-2, ..., next-D
-         → 训练数据效率提升 + 推理可用于 speculative
-         → 未在大规模生产模型使用
+单卡:        Avg_TTFT = D + R·D² / (2·(1−R·D))
 
-2024-12: DeepSeek-V3 Technical Report
-         → 改进版 MTP: D 个 sequential 模块 (非独立并行)
-         → 保完整因果链: 每个 depth k 用前面 k-1 的表征
-         → 生产开源, 掀起 MTP 复兴
+2-way inter-op (PP):
+             Avg_TTFT = D + R·D² / (4·(2−R·D))
 
-2025+:   SGLang / vLLM / TRT-LLM 陆续加 MTP 支持
+2-way intra-op (TP), K ∈ (1, 2) 为加速系数:
+             Avg_TTFT = D/K + R·D² / (2K·(K−R·D))
 ```
 
-#### 8.3.3 DeepSeek-V3 MTP 架构（重点）
+决策规则：
 
-```
-输入序列: [t_1, t_2, t_3, ..., t_n]
-主模型输出: h_i (第 i 位置的最终 hidden state)
-
-MTP Module k (k=1..D, D 通常 = 4):
-  ┌────────────────────────────────────────────────────┐
-  │ 输入 1: 前一 depth 的表征 h_i^(k-1) [已 RMSNorm]    │
-  │ 输入 2: 未来第 k 个 token 的 embedding [已 RMSNorm] │
-  │        (embedding 层与主模型共享)                   │
-  │                                                    │
-  │   concat → 线性投影 M_k (d × 2d) → Transformer 块  │
-  │   → 输出 h_i^(k)                                   │
-  │   → 通过共享的 output head 得到 t_{i+k} 的预测     │
-  └────────────────────────────────────────────────────┘
-
-关键:
-  1. embedding 和 output head 全部共享 (省参数)
-  2. 深度间是 sequential 的 (保因果链)
-  3. 与 Meta 版本 (parallel heads) 不同, 生成质量更好
-```
-
-#### 8.3.4 训练收益
-
-| 收益 | 说明 |
+| 条件 | 偏向 |
 |---|---|
-| **监督信号 densify** | 每个位置贡献 D 个 loss，训练数据效率提升 |
-| **表征质量提升** | 强制模型 pre-plan 未来 tokens 的表征 |
-| **无需推理开销** | 训练用，推理阶段 MTP 模块可选 discard |
+| 低到达率 R（执行时间占比高） | **TP** |
+| 高到达率 R（排队时间占比高） | **PP** |
+| 紧 TTFT SLO | **TP** |
+| 弱互联（K 小） | **PP**（TP 收益打折） |
 
-#### 8.3.5 推理收益（作为 speculative decoder）
+**Prefill vs Decode 各自最优**（DistServe 实测，OPT-175B on ShareGPT）：
 
-DeepSeek-V3 官方数据：
-- **第二 token 接受率**：**85%-90%**（跨话题稳定）
-- **端到端 TPS 提升**：**1.8x**（Tokens Per Second）
-
-vLLM 社区实测（DeepSeek-R1，k=1）：
-- 接受率 81-82.3%
-- QPS=1 时 **1.63x** 加速
-- 高 QPS (>8) 下加速衰减（batch 摊薄了 speculative 的 GPU 空闲时间）
-
-SGLang 官方博客（2025-07）：
-- MTP 端到端 **+60% output throughput**（DeepSeek V3，无质量损失）
-
-#### 8.3.6 MTP vs EAGLE：如何选
-
-| 维度 | MTP | EAGLE-3 |
+| 阶段 | 最优 (inter_op, intra_op) | 原因 |
 |---|---|---|
-| **训练** | 与主模型联合训练 | Draft 独立训练 |
-| **权重** | MTP heads 是模型自带参数（DeepSeek-V3 权重发布已含） | 需单独训 draft 权重 |
-| **接受率** | 85-90% (DeepSeek-V3 报告) | 类似或略高（EAGLE-3 报告 up to 6.5x） |
-| **通用性** | 只能用在**训练时加过 MTP** 的模型 | 可为**任何**主模型训 draft |
-| **生产成熟度** | DeepSeek 生态原生，其他模型需重训 | SGLang / vLLM 集成，多模型通用 |
+| Prefill | (3, 3) | 中等 batch，TP 减 TTFT |
+| Decode | (3, 4) | Batch 大，需要更大 TP 减 TPOT |
 
-**选型建议**：跑 DeepSeek 模型时 **MTP 无脑用**（权重免费送）；跑 Llama / Qwen 等其他模型时 **EAGLE-3 训 draft**。
-
-### 8.4 EAGLE 系列演进（通用推测解码 SOTA）
-
-EAGLE 是当前**通用推测解码 SOTA**（2026），三代演进逻辑清晰：
-
-#### 8.4.1 三代对比
-
-| 版本 | 时间 | 论文 | 核心思路 | 加速比 |
-|---|---|---|---|---|
-| **EAGLE-1** | 2024-01 | arXiv 2401.15077 | Draft 在 **feature level**（second-to-top-layer）自回归 + tree attention | 3x vs vanilla<br>1.6x vs Medusa (13B) |
-| **EAGLE-2** | 2024-06 | ICML'24 | 动态 draft tree（depth / width 按上下文调整） | 3.5x vs vanilla |
-| **EAGLE-3** | 2025-03 | arXiv 2503.01840 | **抛弃 feature prediction, 直接 token prediction** + multi-layer feature fusion via "training-time test" | **6.5x** peak<br>1.4x vs EAGLE-2 |
-
-#### 8.4.2 每代关键突破的直观理解
+#### KV Cache 传输的量级估算
 
 ```
-EAGLE-1 vs Medusa:
-   Medusa 用 K 个独立 heads 并行猜, 无因果依赖 → 命中率 ~50-65%
-   EAGLE-1 在 feature 层做自回归猜 → 命中率 ~70-80%
-   多几个点意味着 "接受长度" 从 2.5 涨到 4.0, 直接 1.5x
+KV_size = 2 · num_heads · head_dim · seq_len · num_layers · dtype_bytes
 
-EAGLE-2:
-   静态 draft tree 有的分支永远不用 (context 无关的浪费)
-   动态调整 tree 结构 → 高价值分支用更多 budget
-   +15% acceptance length
-
-EAGLE-3:
-   意外发现: EAGLE-1/2 的 feature prediction 有 "训练数据饱和" 问题
-   → 抛弃 feature, 让 draft 直接预测 token
-   + 用多层 (不只 second-to-top) feature 融合
-   + "training-time test" 缩小 training / inference gap
-   → 数据 scaling 恢复, 6.5x 天花板
+OPT-66B, 512 tokens: 1.13 GB
+Llama-70B, 4K tokens: 10.6 GB
+DeepSeek-V3 (MLA), 4K tokens: ~0.7 GB
 ```
 
-#### 8.4.3 生产落地
+跨节点传输耗时：
 
-- **SGLang**：EAGLE-3 官方合作，SpecForge 训练框架 2025-07 开源
-- **vLLM**：Speculators v0.3.0 (2025-12) 官方将 EAGLE-3 列为当前 SOTA
-- **AWS**：P-EAGLE（Parallel EAGLE）优化版本，AWS Blog 2026
-- **TensorRT-LLM**：Speculative Sampling 章节支持 EAGLE
+| 链路 | 峰值 | 10 GB 传输 |
+|---|---:|---:|
+| NVLink (H100 8卡) | 900 GB/s | 11 ms |
+| InfiniBand NDR 400G | 50 GB/s | 200 ms |
+| 25 GbE 以太网 | 3.1 GB/s | 3200 ms |
 
-**结论**：非 DeepSeek 生态（Llama、Qwen、Mistral 等）想上推测解码，**EAGLE-3 是默认选择**。
-
-### 8.5 FlashInfer：Attention Kernel 库范式（MLSys'25 Best Paper）
-
-#### 8.5.1 定位
-
-FlashAttention（Tri Dao, 2022）解决了长上下文 attention 的 IO 瓶颈。但**FlashAttention 只是一个 kernel**。到 2024-2025，LLM serving 涌现出海量 attention 变体：
+#### Layer-wise 传输 overlap 计算（Mooncake 实现）
 
 ```
-仅 attention 就有 ~10 种变体:
-  · Prefill attention (长 sequence, batch=1)
-  · Decode attention (短 query, KV cache 长)
-  · Paged attention (KV cache 分页, vLLM 用)
-  · Radix attention (prefix cache, SGLang 用)
-  · MLA - Multi-head Latent Attention (DeepSeek 用)
-  · Grouped Query Attention (Llama-2 70B 用)
-  · Sliding window (Mistral 用)
-  · Cross attention (encoder-decoder)
-  · Speculative verify attention (tree structure)
-  · Chunked prefill attention
+Prefill 侧, 逐 layer 处理:
+  for layer in 0..L-1:
+      wait(async_load[layer])         # 等 prefix cache 就位
+      trigger(async_load[layer+1])    # 预取下一层
+      run_attention(layer)            # GPU 计算
+      trigger(async_store[layer])     # 异步传出本层 KV
+  wait(all_pending_stores)
 
-每种都要手写高性能 CUDA kernel? → 组合爆炸, 维护地狱
+Wall time = max(load_time, prefill_time)   # 而非串行相加
 ```
 
-**FlashInfer 的解**：一个**统一的 kernel 库 + 生成器**，用 JIT 编译按需生成 kernel。类比 CUTLASS 之于 GEMM，FlashInfer 之于 attention。
+DistServe 论文实测：OPT-175B on ShareGPT，KV 传输占端到端 < 0.1%，>95% 请求传输 < 30ms。
 
-#### 8.5.2 三大核心技术
+#### Mooncake 存储层次
 
 ```
-1. Block-sparse KV Cache 布局
-   传统: KV cache 密集连续 → 稀疏场景 (如 sliding window) 浪费带宽
-   FlashInfer: block-sparse + composable formats
-   → 一份代码支持多种 KV 组织方式 (dense/paged/radix/tree)
+GPU HBM       80 GB    900 GB/s      当前推理 batch 的 KV
+CPU DRAM     500 GB     20 GB/s      prefix cache（近期热点会话）
+SSD (NVMe)   10 TB      3 GB/s       长会话历史
 
-2. JIT-compiled Attention Template
-   用户提供 attention variant 的参数 (mask, scaling, softmax variant...)
-   FlashInfer JIT 生成 fused CUDA kernel
-   → 加新变体不用改库, 用户空间描述即可
-
-3. Load-Balanced Scheduler
-   不同请求 seq_len 差异大 → 负载不均, GPU SM 空闲
-   FlashInfer 动态调度确保每个 SM 满载
-   + 保持 CUDAGraph 兼容 (静态签名)
+KV block 粒度: 512 tokens
+Hash tag:      block 内容 + 全部前缀（用于 dedup + 复用）
+Eviction:      LRU（论文实测最优）
 ```
 
-#### 8.5.3 关键数字（vs 主流 baseline）
+**Conductor 调度算法**（选 prefill 节点）：
 
-| 场景 | FlashInfer 相对 SOTA baseline |
+```
+for candidate in prefill_instances:
+    prefix_match_len = longest_prefix(request, candidate.cache)
+    T_queue = estimate_queue_time(candidate)
+    T_prefill = estimate_prefill_time(len(request) - prefix_match_len)
+    T_TTFT_est = T_queue + T_prefill
+
+    # 如果远端命中的前缀比本地多（超过阈值），考虑跨节点拉 prefix
+    if best_remote_match - local_match > kvcache_balancing_threshold:
+        T_TTFT_est += T_transfer
+
+    if T_TTFT_est > TTFT_SLO:
+        continue  # 不满足 SLO 直接跳过
+
+select instance with min(T_TTFT_est)
+if none selected: return HTTP 429
+```
+
+#### 数据
+
+| 系统 | 论文 | 数据集 / 模型 | 报告数字 |
+|---|---|---|---|
+| **DistServe** | OSDI'24 | ShareGPT / OPT-175B | 请求率 **4.48x**；SLO 可紧缩 **10.2x** |
+| **Splitwise** | ISCA'24 | Azure trace | 同资源吞吐 **2.35x**；同吞吐成本 **−20%**（对应 1.4x throughput/$） |
+| **Mooncake** | FAST'25 | Kimi 生产 trace | 长上下文吞吐 **+525%**；实际处理请求 **+75%** |
+| **Mooncake Kimi K2 (1T)** | 官方 blog | 128× H200 | Prefill **224k tokens/s**；Decode **288k tokens/s** |
+
+#### 工程支持
+
+| 框架 | 版本 | Connector | 传输协议 |
+|---|---|---|---|
+| **vLLM** | ≥ 0.6.0 | `NixlConnector` / `MooncakeConnector` / `MooncakeStoreConnector` | NCCL P2P / RDMA / Mooncake Transfer Engine |
+| **SGLang** | 主干 | HiCache（layer-wise 传输） | Mooncake Transfer Engine |
+| **TensorRT-LLM** | Dynamo 框架 | NVIDIA 官方 | NCCL |
+| **LMDeploy** | v0.12+ | DLSlime / Mooncake protocol | RDMA |
+| **DeepSeek 开源栈** | V3 起 | 自研 | 内部 |
+
+vLLM 配置示例：
+
+```yaml
+# vllm serve --kv-transfer-config <file>
+kv_connector: MooncakeConnector
+kv_role: kv_producer          # prefill 节点角色
+kv_rank: 0
+kv_parallel_size: 2
+```
+
+---
+
+### 8.2 MTP（Multi-Token Prediction）
+
+DeepSeek-V3 引入，模型自带的推测解码机制。
+
+#### 架构（DeepSeek-V3 §2.2）
+
+```
+主模型 (61 层 MoE Transformer)
+输入序列 [t₁, ..., tₙ] → 每 token 输出 hidden state h_i
+
+MTP Module k (k = 1..D):
+  ┌────────────────────────────────────────────────────────┐
+  │                                                        │
+  │   前一 depth 表征 h_i^(k-1)  ─── RMSNorm ──┐           │
+  │                                            ├── concat ─┤
+  │   未来 token embed e(t_{i+k}) ── RMSNorm ──┘           │
+  │       (embedding 层与主模型共享)                       │
+  │                                              │         │
+  │                                              ▼         │
+  │                                     Linear M_k         │
+  │                                     (d × 2d)           │
+  │                                              │         │
+  │                                              ▼         │
+  │                                     Transformer 块     │
+  │                                              │         │
+  │                                              ▼         │
+  │                                     h_i^(k)            │
+  │                                              │         │
+  │                                              ▼         │
+  │                                     共享 output head   │
+  │                                              │         │
+  │                                              ▼         │
+  │                                     p_{i+k+1}          │
+  │                                                        │
+  └────────────────────────────────────────────────────────┘
+
+关键约束: h_i^(k) 依赖 h_i^(k-1)  → sequential, 保完整因果链
+         (与 Meta 2024 论文的 D 个 parallel head 结构不同)
+```
+
+#### 训练目标
+
+```
+每个 depth 的 loss (T = 序列长度):
+   L_MTP^k = −(1/T) · Σ_{i=2+k..T+1} log P_i^k[t_i]      # cross-entropy
+
+总 MTP loss (D 个 depth 平均, λ 加权):
+   L_MTP = (λ/D) · Σ_{k=1..D} L_MTP^k
+
+总训练 loss:
+   L_total = L_main + L_MTP
+```
+
+DeepSeek-V3 官方设置（论文 §2.2 / §5.4.3）：
+- 训练时 **D = 1**（单 MTP module）
+- λ 具体数值论文未明确公开
+
+#### 推理路径
+
+**Mode A：discard MTP**
+```
+主模型独立 forward, 与常规 decode 相同, 无额外开销
+```
+
+**Mode B：MTP 作为 speculative decoder**
+```
+Step 1: 主模型 forward, 得 h_i, 采 token t_{i+1}
+Step 2: MTP module k=1, 用 (h_i, e(t_{i+1})) 前向 → 猜 t_{i+2}
+Step 3: 主模型 forward [t_{i+1}, t_{i+2}] (一次前向覆盖 2 个位置)
+Step 4: 位置 i+2 处主模型输出 vs MTP 猜测 t_{i+2}
+        · 一致 → 接受, 净生成 2 tokens
+        · 不一致 → 丢弃 MTP 猜测, 保留主模型输出, 净生成 1 token
+```
+
+#### 数据
+
+| 来源 | 场景 | 数字 |
+|---|---|---|
+| DeepSeek-V3 §5.4.3 | 跨话题第 2 token 接受率 | **85%-90%** |
+| DeepSeek-V3 官方 | 端到端 Tokens/s | **1.8x** |
+| SGLang blog (2025-07) | DeepSeek V3 + MTP | 输出吞吐 **+60%**，质量无损 |
+| vLLM 社区 | DeepSeek-R1, k=1 | 接受率 81-82.3%；QPS=1 时 **1.63x**；QPS>8 时加速衰减 |
+
+#### 工程支持
+
+| 框架 | 版本 | 配置 |
+|---|---|---|
+| **SGLang** | ≥ v0.4.5 | `--speculative-algorithm EAGLE --speculative-draft-model <deepseek-model>` |
+| **vLLM** | ≥ 0.7 | `--speculative-config '{"model": "...", "num_speculative_tokens": 1}'` |
+| **TensorRT-LLM** | 主干 | Speculative Sampling MTP variant |
+
+**限制**：只能用于**训练阶段启用 MTP** 的模型（DeepSeek-V3 / R1 权重发布已含 MTP heads）。Llama / Qwen 等要用需重训或走 EAGLE。
+
+---
+
+### 8.3 EAGLE（feature-level speculative decoding）
+
+#### 原理
+
+**Feature 定义**（EAGLE-1）：
+
+```
+Target LLM forward path:
+  T_{1:j} ─→ Embedding ─→ E_{1:j} ─→ ... ─→ f_j ─→ LM_Head ─→ p_{j+1} ─→ t_{j+1}
+                                            ↑
+                                            └── EAGLE 说的 "feature":
+                                                second-to-top hidden state
+```
+
+**关键洞察**：直接预测 token 命中率低（token 是从分布采样的，本质随机）；改在 feature 层做自回归——feature 是**确定的向量**。
+
+#### Autoregression Head 架构（EAGLE-1）
+
+```
+Input:
+  feature seq    F_{1:i} = (f_1, ..., f_i)         shape (bs, i, d)
+  token seq (前移一位) T_{2:i+1}                    shape (bs, i)
+
+Step 1: token → embedding (用 target 的 embedding 层, frozen)
+        → E_{2:i+1}                                 shape (bs, i, d)
+
+Step 2: concat feature 与 embedding on hidden dim
+        → shape (bs, i, 2d)
+
+Step 3: FC 层 (2d → d)                              # 唯一大参数
+        → shape (bs, i, d)
+
+Step 4: 单个 Transformer decoder layer
+        → 预测 f̂_{i+1}                              shape (bs, 1, d)
+
+Step 5: 用 target 的 LM Head (frozen)
+        → p̂_{i+2} = Softmax(LM_Head(f̂_{i+1}))
+        → 采样 t̂_{i+2}
+
+Step 6: 把 (f̂_{i+1}, t̂_{i+2}) 追加到输入, 继续 autoregress
+```
+
+#### 可训练参数量
+
+| Target LLM | Trainable params | 占比 |
+|---|---:|---:|
+| 7B | 0.24B | 3.4% |
+| 13B | 0.37B | 2.8% |
+| 33B | 0.56B | 1.7% |
+| 70B | 0.99B | 1.4% |
+| Mixtral 8×7B | 0.28B | — |
+
+#### Tree Attention
+
+```
+不是线性 draft n 个 token, 而是 tree-structured (fanout k=4 at root):
+
+              Root (last real token)
+              /   |   |    \
+        cand_1  c_2  c_3  cand_4      (top-4 by prob)
+        / | \
+    gc_1a gc_1b gc_1c                 (每个 c 也有 fanout)
+        ...
+
+Verify 阶段:
+  target LLM 一次 forward + tree mask attention
+  → 每 tree node 的接受概率
+  → Multi-Round Speculative Sampling (Algorithm 1) 递归验证:
+      · 若某候选被拒 → 用调整后分布 norm(max(0, p - p̂)) 试下一 sibling
+      · 若 k 个 sibling 全拒 → 从调整后分布采样
+  → 落到接受最深的一支
+
+实测: depth m 的 tree 通过 m 次 draft forward 生成 >m tokens
+     示例: 10-token tree 只需 3 次 forward
+```
+
+#### 训练 loss（EAGLE-1）
+
+```
+L_reg = SmoothL1(f_{i+1}, DraftModel(T_{2:i+1}, F_{1:i}))    # 特征回归
+
+# 分类 loss 走 frozen LM Head, distillation-style:
+p_{i+2}   = Softmax(LM_Head(f_{i+1}))         # target 真实 feature 过 head
+p̂_{i+2}  = Softmax(LM_Head(f̂_{i+1}))         # draft 预测 feature 过 head
+L_cls = CrossEntropy(p_{i+2}, p̂_{i+2})
+
+L_total = L_reg + w_cls · L_cls,   w_cls = 0.1  # (回归 loss 数量级小 10 倍)
+```
+
+**训练数据增强**：训练时对输入 feature 加均匀噪声 U(−0.1, 0.1)，缓解 autoregression 推理阶段的误差累积。
+
+**训练成本**：
+- 7B/13B/33B：单节点 RTX 3090，1-2 天
+- 70B：4× A100 40G，1-2 天
+- 数据：ShareGPT ~68k 对话
+
+#### 三代主要差异
+
+| 版本 | 时间 | 与前代差异 | 论文数字 |
+|---|---|---|---|
+| **EAGLE-1** | 2024-01, arXiv 2401.15077 | 上述 baseline，固定 tree | vs vanilla 3.0x；vs Medusa 1.6x (13B) |
+| **EAGLE-2** | 2024-06, EMNLP'24 | **动态 draft tree**：按上下文调整 depth/width，不更新 draft 参数 | vs vanilla ~3.5x |
+| **EAGLE-3** | 2025-03, arXiv 2503.01840 | **抛弃 feature prediction**，改直接 token prediction + multi-layer feature fusion via "training-time test" | up to **6.5x** vs vanilla；SGLang batch=64 throughput 1.38x；1.4x vs EAGLE-2 |
+
+**EAGLE-3 关键动机**：EAGLE-1/2 的 draft 命中率随训练数据增加**饱和**（论文观察）。原因是 feature-level 自回归限制了 draft 能学到的信息。EAGLE-3 让 draft 直接预测 token distribution，配合**多层 target feature 融合**（不只 second-to-top），突破饱和。
+
+#### 工程支持
+
+| 框架 | 版本 | 配置示例 |
+|---|---|---|
+| **vLLM** | ≥ 0.7 (Speculators v0.3.0) | 见下 |
+| **SGLang** | ≥ v0.4 | SpecForge 训练工具链（2025-07 开源） |
+| **TensorRT-LLM** | 主干 | Speculative Sampling API |
+| **AWS Bedrock** | 2026-Q1 | P-EAGLE（parallel drafting） |
+
+vLLM 配置：
+
+```bash
+vllm serve meta-llama/Llama-3-8B \
+  --speculative-config '{
+    "model": "yuhuili/EAGLE-LLaMA3-Instruct-8B",
+    "num_speculative_tokens": 5,
+    "draft_tensor_parallel_size": 1
+  }'
+```
+
+---
+
+### 8.4 FlashInfer（LLM 推理 attention kernel 库）
+
+MLSys'25 Best Paper (arXiv 2501.01005)。
+
+#### 定位
+
+FlashAttention 是**单个 kernel**（长上下文 attention 的 IO 优化）。LLM serving 涌现的 attention 变体已经十几种：paged / radix / sliding-window / MLA / cross / speculative tree / chunked prefill / logits-cap 等。手写维护成本不可控。
+
+FlashInfer 的方案：**统一 kernel 库 + JIT 生成器**，类比 CUTLASS 之于 GEMM。
+
+#### 机制 1：Block Sparse Row (BSR) 统一 KV 布局
+
+```
+BSR 表示 (Block Compressed Sparse Row):
+  indptr  = [0, 2, 3, 5, ...]      # 每 row 的 block 起点
+  indices = [0, 3, 1, 2, 4, ...]   # 每 block 的列索引
+  data    = 顺序拼接的 dense KV blocks
+
+Tile size (B_r, B_c):
+  · 传统 FA2: 要求 (128, 128) 倍数
+  · FlashInfer: 任意 (B_r, B_c), 包括 (16, 1) / (1, 16) 这种细粒度
+
+Composable Formats (多请求共享 prefix):
+  prefix 部分:  (3, 1) 大块 → 多 query 复用 shared memory
+  独立后缀:     (1, 1) 小块 → 精细化
+  实现: 只调整 indices/indptr 数组, 无数据搬移
+```
+
+一个 BSR 表达可覆盖：Paged Attention (vLLM)、Radix Tree (SGLang)、Tree Attention (speculative)、KV importance mask。
+
+#### 机制 2：JIT 生成 attention kernel
+
+Attention 表达式模板：
+
+```
+Output = f_epilogue( scan( f_logits( f_q(Q) · f_k(K) ) ) · f_v(V) )
+```
+
+用户可注入的 hook（inspired by FlexAttention, 扩展了 Q/K/V transform）：
+
+| Functor | 用途 |
 |---|---|
-| **Inter-token latency** (decode) | **↓ 29-69%** |
-| **Long-context latency** | ↓ 28-30% |
-| **Parallel generation** | ↑ 13-17% |
+| `QueryTransform` / `KeyTransform` / `ValueTransform` | 融合 RoPE / normalization / MLA 投影 |
+| `LogitsTransform` | soft-cap (Gemma-2 / Grok)、ALiBi |
+| `LogitsMask` | causal、sliding window、custom mask |
+| `OutputTransform` | 输出后处理 |
+| Softmax on/off | 支持 FlashSigmoid 等无 softmax 变种 |
 
-#### 8.5.4 生产整合（2026-07 快照）
-
-- **vLLM**：默认 attention backend 之一
-- **SGLang**：核心依赖
-- **MLC-Engine**：整合
-- **NVIDIA**：2025-11 官方发布优化过的 FlashInfer LLM serving kernels
-- **ROCm**：2025-10 AMD 移植版本（跨硬件）
-- **MLSys 2026**：NVIDIA 主办 FlashInfer AI Kernel Generation Contest
-
-**结论**：**FlashInfer 已成为 LLM 推理 attention kernel 的事实标准**，直接用第三方 kernel（cuDNN MHA / xFormers）已经过时。做 LLM serving 时看框架有没有集成 FlashInfer，是判断技术栈新鲜度的重要指标。
-
-### 8.6 Sampling 算子重构（2025-03 FlashInfer Sorting-Free）
-
-#### 8.6.1 被忽视的瓶颈
-
-大部分人认为 sampling（从 logits 选下一个 token）是"最便宜的一步"。**错**——现代 LLM 词汇表 vocab_size 涨到 128K+（Llama-3 128K, Qwen 152K），传统 sampling 已是 decode 阶段的显著 overhead。
+生成流程：
 
 ```
-传统 PyTorch / vLLM v0 sampling:
-  1. logits.sort()               O(V log V), V=vocab_size
-  2. gather + mask (top-k)       O(V)
-  3. softmax + cumsum + mask (top-p)  O(V)
-  4. scatter to invert sort      O(V)
-  → 4+ 次 kernel launch, 显存带宽被 sort 吃掉
-
-V=128K, batch=64 时:
-  sampling 占 decode step 20-30% 时间 (!!)
+用户提交 CUDA 代码字符串
+       ↓
+nvrtc / torch.utils.cpp_extension JIT 编译
+       ↓
+注册为 custom op (PyTorch / DLPack)
 ```
 
-#### 8.6.2 核心创新：Dual Pivot Rejection Sampling
-
-FlashInfer 2025-03 blog "Sorting-Free GPU Kernels for LLM Sampling"：
+#### 机制 3：Load-balanced Scheduler（灵感来自 Stream-K）
 
 ```
-朴素 rejection sampling 的问题:
-  接受轮数无上界 → 尾延迟不可控
+Algorithm 1:
+  1. tile cost 定义: cost(l_q, l_kv) = α · l_q + β · l_kv
+  2. KV chunk 上限 L_kv = 总工作量 / CTA_count
+  3. 每 query tile 的 KV 按 L_kv 切成 chunks
+  4. chunks 按 cost 降序排序
+  5. 贪心分配: 最小堆维护各 CTA 累积 cost
+              每次将最大 chunk 给累积 cost 最小的 CTA
 
-Dual Pivot Rejection Sampling (FlashInfer v0.2.3):
-  每轮用 2 个 pivot 判断:
-    pivot_1 = 当前 sampled 概率
-    pivot_2 = (pivot_1 + high) / 2
-  三种情况:
-    - 接受当前 sample
-    - 用 pivot_1 收缩范围
-    - 用 pivot_2 收缩范围
-  → 每轮范围至少减半 → O(log(1/ε)) worst case
-  → 尾延迟可预测, 生产稳定
+Plan / Run 分离 (Inspector-Executor):
+  plan()  在 CPU 侧, 每 step 执行 1 次, 跨所有 layer 复用
+  run()   persistent kernel, grid size 固定 → CUDAGraph 兼容
 ```
 
-#### 8.6.3 数字（vLLM 1×H100）
+**Attention 与 contraction（合并 split-KV partial output）融合进一个 persistent kernel**。
 
-- **Sampling 时间 ↓ >50%** across three tested models
-- 单 kernel 融合 top-k / top-p / temperature，取代原 4 步 pipeline
+#### 支持的 kernel 类型
 
-#### 8.6.4 落地
+- Attention 变种：dense/sparse prefill、decode、append、shared-prefix、tree attention (speculative)、sliding window、custom mask、logits soft-cap、FlashSigmoid、MLA、fused RoPE+attention
+- Contraction kernel：split-KV partial output 合并
+- Sampling kernel：见 8.5
 
-- **FlashInfer** 内建，可直接调用 `flashinfer.sampling.top_k_top_p_sampling_from_probs`
-- **vLLM v1** 已集成
-- **SGLang / MLC-LLM** 集成
+（GEMM **不在** FlashInfer 主库。）
 
-**结论**：这是过去两年"最容易被 overlook 但收益最直接"的优化之一——只需换库调用，不动模型，decode QPS 立涨。
+#### 数据（论文 Table，vs Triton backend）
 
-### 8.7 其他值得关注的方向（2026-07 速览）
+| 场景 | FlashInfer 相对 |
+|---|---|
+| Decode inter-token latency (ITL) | ↓ **29-69%** |
+| Long-context latency | ↓ **28-30%** |
+| Parallel generation | ↑ **13-17%** |
 
-以下技术每个都可以独立成章，本节仅提供**是什么、为什么重要、代表实现**，深挖留作后续独立文档。
+#### 工程支持
 
-#### 8.7.1 MLA（Multi-head Latent Attention）—— DeepSeek V2/V3 首创
-
-**问题**：GQA 只是把 KV heads 数量减少（多 Q 共享 KV），但 head_dim 还是原尺寸。KV cache 大小仍然线性于 num_heads。
-
-**MLA 思路**：把 KV cache 压缩到一个 low-rank latent 空间（rank << head_dim），在计算 attention 时才展开。
-
-**收益**：DeepSeek-V2 KV cache 相比 Llama-2 70B 小 **93%**，长上下文可行性大幅提升。
-
-**代价**：需要 MLA-aware 的 kernel（FlashInfer / vLLM 都已支持）。
-
-#### 8.7.2 RadixAttention（SGLang）—— Prefix Cache 跨请求共享
-
-**问题**：多轮对话、few-shot prompting、code completion 场景下，**同一段 prefix 被反复计算**。
-
-**解**：用 Radix tree 管理所有请求的 KV cache 前缀，命中就复用。SGLang 首创（2024）。
-
-**数字**：多轮对话场景 **2-5x** 吞吐提升。
-
-**生产**：SGLang 核心，vLLM 也加了 prefix caching。
-
-#### 8.7.3 Chunked Prefill —— 从技术到标配
-
-Part 7.6 提过。**已成 2026 生产标配**（vLLM / SGLang / TRT-LLM 默认开启）。价值在于 P/D 分离前的过渡方案 + P/D 分离场景下调度 prefill chunk。
-
-#### 8.7.4 FP4 / Blackwell —— 硬件新精度维度
-
-**H100 引入 FP8**（Hopper, 2022），**B200 引入 FP4**（Blackwell, 2024-2025）。FP4 可让 Llama-70B 塞进 40GB 显存（原 140GB FP16），推理成本再降 4x。
-
-**软件生态**：TensorRT-LLM / vLLM / SGLang 正在完善 FP4 支持（2026 全年主线）。
-
-**注意**：FP4 精度损失比 FP8 大，需 QAT 或 SmoothQuant / AWQ 等激活迁移技术协助。
-
-#### 8.7.5 长上下文优化 —— 从 4K 到 1M
-
-| 技术 | 核心思路 | 时间 |
+| 框架 | 版本 | 用法 |
 |---|---|---|
-| **YaRN** | RoPE 频率插值扩展 | 2023 |
-| **StreamingLLM** | Attention sink + sliding window，无限流式 | 2023-09 |
-| **RingAttention** | 跨 GPU 分块 attention | 2023-10 |
-| **Landmark Attention** | 关键 token 特殊标记 | 2023 |
-| **Gemini 1.5 / Claude 3** | 生产 1M+ 上下文 | 2024-2025 |
+| **vLLM** | ≥ 0.5 | `VLLM_ATTENTION_BACKEND=FLASHINFER` |
+| **SGLang** | 主干 | 默认 backend |
+| **MLC-Engine** | ≥ 2025 | 默认 |
+| **NVIDIA** | 2025-11 | 官方发布优化过的 FlashInfer LLM serving kernels |
+| **ROCm (AMD)** | 2025-10 | 移植版本 |
 
-**趋势**：长上下文推理已从"研究话题"变成"生产要求"（RAG / 代码 / 论文助手），系统层配套（KV cache 池化、chunked prefill、P/D 分离）都是为此服务。
+Python API（decode kernel 示例）：
 
-#### 8.7.6 Encoder 侧的前沿（低热度但真实）
+```python
+import flashinfer
 
-Encoder-only 模型（BERT / ViT / voice_safety）领域相对 LLM 热度低，但也有：
-- **BEiT-3 / EVA** 统一 vision + text encoder
-- **Flash-Linear-Attention** 线性注意力生产落地
-- **RWKV / Mamba** 状态空间模型作为 encoder 替代（长序列友好）
-
-**结论**：Encoder 模型 2025-2026 主要动向在**架构侧**（Transformer 替代品），推理编译栈变化不大，TRT / OpenVINO 依然是首选。
-
-### 8.8 前沿选型指南：ROI 提示
-
-**Q: 生产 LLM serving 想升级，先做什么？**
-
-按 ROI 排序（回本快 → 慢）：
-
-```
-Tier 1 (立即可做, 换库调用即可):
-  ├─ FlashInfer 集成 (attention kernel)          → decode latency ↓ 30%+
-  ├─ FlashInfer sampling                          → sampling latency ↓ 50%+
-  └─ Prefix caching (vLLM/SGLang 已内建)          → 多轮对话 2-5x
-
-Tier 2 (需要工程量, 但架构可控):
-  ├─ Chunked prefill 打开                        → P99 稳定性
-  ├─ Continuous batching (基础功能, 未开必开)     → GPU util 30% → 80%
-  └─ 量化到 FP8/INT4 (AWQ/GPTQ)                  → 显存 2-4x
-
-Tier 3 (深度架构改动):
-  ├─ P/D 分离 (需要 IB 网络 + Mooncake 协议)     → 生产吞吐 2-5x
-  ├─ 推测解码 (MTP if DeepSeek else EAGLE-3)     → decode 1.4-6.5x
-  └─ MLA (需要模型侧改造, 主要走 DeepSeek)        → KV cache 90%+ 减
-
-Tier 4 (换硬件):
-  └─ H100 → H200 → B200                          → 显存 + 带宽双升
+# Paged KV cache 上的 decode attention
+wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "NHD")
+wrapper.plan(
+    indptr, indices, last_page_len,
+    num_qo_heads, num_kv_heads, head_dim,
+    page_size=16, data_type=torch.float16
+)
+o = wrapper.run(q, paged_kv_cache)
 ```
 
-**Q: 学习优先级？（面试 / 晋升场景）**
+---
 
-必知（能讲原理 + 生产数字）：
-1. P/D 分离（Mooncake 架构一定要能画图）
-2. EAGLE-3 / MTP 至少一个
-3. FlashInfer 定位（不需要读 kernel 源码）
+### 8.5 Sampling 算子重构（FlashInfer sorting-free）
 
-加分：
+FlashInfer v0.2.3，2025-03 引入。
 
-4. Sampling 算子重构（体现"细节意识"）
-5. MLA / RadixAttention（体现"跟进最新"）
+#### 传统 sort-based sampling
 
-**Q: 会不会过时？**
+vLLM v0 / PyTorch 的 pipeline：
 
-- **P/D 分离**：架构级重构，未来 3 年主线，不会过时。
-- **推测解码**：Model-inherent 方向（MTP）会挤压外挂 draft（EAGLE），但整体投机思路成熟稳定。
-- **FlashInfer**：作为 kernel library 有生态壁垒，短期不会被替代。
-- **FP4 / B200**：硬件驱动，看 NVIDIA 节奏（明年迭代继续）。
+```python
+def top_k_top_p_sampling(logits, top_k, top_p):
+    sorted_logits, sorted_idx = logits.sort(descending=True)   # O(V log V)  ← 主开销
+    sorted_logits[..., top_k:] = -float('inf')                 # top-k mask
+    probs = softmax(sorted_logits)
+    cum_probs = probs.cumsum(dim=-1)
+    top_p_mask = cum_probs > top_p
+    sorted_logits[top_p_mask] = -float('inf')                  # top-p mask
+    sampled_sorted_idx = multinomial(softmax(sorted_logits))
+    return sorted_idx.gather(-1, sampled_sorted_idx)           # scatter back
+```
+
+耗时随 vocab_size 增长：
+
+| 模型 | V | Batch=64 sampling (H100) | 占 decode step |
+|---|---:|---:|---:|
+| Llama-2 | 32K | ~0.2 ms | ~5% |
+| Llama-3 | 128K | ~0.8 ms | ~15% |
+| Qwen-3 | 152K | ~1.0 ms | ~20% |
+
+（decode 单步 ~5-15 ms 参考）
+
+#### Dual Pivot Rejection Sampling
+
+数学基础：
+
+```
+目标: 从截断分布 p_filtered / Z 采样
+  (filter = top-k 或 top-p 掉的部分设为 0, Z 是归一化常数)
+
+朴素 rejection: 采样后若 token 在 filtered 集就 reject 重来
+  问题: 接受轮数无上界 → 尾延迟不可控
+```
+
+Dual Pivot 算法（简化伪代码）：
+
+```
+Init: low ← 0, high ← max(p_i)
+
+loop:
+    u ← uniform(0, 1)
+    j ← inverse_transform_sample(u, valid_range=(low, ∞))
+    p_j ← probability of token j
+
+    pivot_1 ← p_j
+    pivot_2 ← (pivot_1 + high) / 2
+
+    if j is in filter_set (top-k / top-p):
+        return j                        # accept
+    else:
+        # 用 pivot_1 或 pivot_2 收缩 (low, high)
+        # 保证每轮至少减半
+        (low, high) ← shrink_range(...)
+
+复杂度: O(log(1/ε)) worst case, ε = 浮点最小可表示值
+       → 尾延迟可预测
+```
+
+**Correctness**：论文形式化证明输出概率恰为 p_j / Z（与直接 filter + categorical 数学等价）。
+
+**Kernel 实现**：单个 fused CUDA kernel，用 CUB primitive：
+- `BlockReduce`（求 max、sum）
+- `BlockScan`（cumsum）
+- `AdjacentDifference`
+
+**Early stopping**：累积概率超过随机数 u 就 exit，不用扫全 vocab。
+
+#### 数据（论文，vLLM 1×H100）
+
+- Sampling 时间 **↓ >50%**（across Llama-3 / Qwen / Mistral 三个模型）
+- 单 kernel 融合 top-k / top-p / temperature，取代原来 4 步 pipeline
+
+#### 工程支持
+
+| 框架 | 状态 | API |
+|---|---|---|
+| **FlashInfer** | 主实现 | `flashinfer.sampling.top_k_top_p_sampling_from_probs(probs, uniform_samples, top_k, top_p)` |
+| **vLLM v1** | 默认（走 FlashInfer） | — |
+| **SGLang** | 默认 | — |
+| **MLC-LLM** | 默认 | — |
+
+同一算法也用于 speculative decoding 的 chain / tree verification。
+
+---
+
+### 8.6 MLA（Multi-head Latent Attention）
+
+DeepSeek-V2/V3 提出。KV cache 从多头张量压缩到 low-rank latent。
+
+#### 原理
+
+标准 MHA / GQA 的 KV cache：
+
+```
+KV_size_per_token = 2 · num_heads · head_dim · dtype_bytes
+
+Llama-2 70B (GQA, num_kv_heads = 8, head_dim = 128, FP16):
+  每 token = 2 × 8 × 128 × 2 = 4 KB
+  32K 上下文 = 128 MB / request
+```
+
+MLA 引入 latent 维度 d_c << num_heads · head_dim：
+
+```
+标准 MHA:
+  K = X · W_K              shape (seq, num_heads · head_dim)
+  V = X · W_V              shape (seq, num_heads · head_dim)
+  存: K, V
+
+MLA:
+  c^KV = X · W_DKV         shape (seq, d_c),  d_c 常取 512
+  K, V 推理时按需展开:
+     K = c^KV · W_UK       (推理时才算)
+     V = c^KV · W_UV
+  存: c^KV (低秩表示)
+
+KV cache 占用对比 (DeepSeek-V2 vs Llama-2):
+  Llama-2 (MHA):  2 · num_heads · head_dim = 4096 元素/token/layer
+  DeepSeek-V2 (MLA): d_c = 512 元素/token/layer
+  → 减 ~93% (论文 §3.2 报告 4x-93% depending on config)
+```
+
+**推理性能保持**：MLA 通过**矩阵吸收**技巧把 W_UK 融进 attention 的其他 matmul（Q · W_UK^T 提前算完存回 W_Q'），实际推理 kernel 与 GQA 相当。
+
+#### 数据
+
+| 模型 | KV cache per token (FP16) | 长上下文可行性 |
+|---|---:|---|
+| Llama-2 70B (MHA) | ~2.6 MB (基线) | 4K 已很吃力 |
+| Llama-2 70B (GQA-8) | ~326 KB | 32K OK |
+| DeepSeek-V2 (MLA) | ~70 KB | 128K 舒适 |
+
+#### 工程支持
+
+| 框架 | MLA 支持 |
+|---|---|
+| **vLLM** | ≥ 0.6，DeepSeek 模型自动走 MLA path |
+| **SGLang** | 主干 |
+| **TensorRT-LLM** | DeepSeek 分支 |
+| **FlashInfer** | 原生 MLA decode kernel（block-sparse KV 表达） |
+
+**限制**：MLA 是**模型架构级设计**，Llama / Qwen 等已有模型不能直接切换（需重训）。
+
+---
+
+### 8.7 RadixAttention（SGLang）
+
+跨请求 prefix 复用，用 radix tree 组织 KV cache。
+
+#### 场景
+
+```
+Request A: "你是助手\n用户: 什么是 Python\n助手: Python 是..."
+Request B: "你是助手\n用户: 什么是 Java\n助手: Java 是..."
+
+共享 prefix: "你是助手\n用户: 什么是 " (30 tokens)
+  · 传统: 每请求独立 prefill 全 30 tokens (重复计算)
+  · RadixAttention: 前 30 tokens 命中 → 直接引用已有 KV block
+                    只需 prefill 差异后缀
+```
+
+#### 数据结构
+
+```
+KV cache 组织为 radix tree:
+
+  root
+   ├─ [tok₀ … tok₁₀]  → block_5
+   │   ├─ [tok₁₁, tok₁₂]  → block_9
+   │   │   └─ ...
+   │   └─ [tok₁₁', tok₁₃']  → block_11
+   └─ [tok₀', ...]  → block_3
+
+匹配算法 (request 到达):
+  1. token 序列按 KV block size (常 16 tokens/block) 分块
+  2. 从 root 沿 tree 向下匹配, 找最长共享 prefix
+  3. 命中的 block 直接引用其物理 KV
+  4. 只 prefill 未命中的后缀
+
+Eviction (LRU):
+  block reference count 归零 → 可回收
+  但保留一段时间以待未来请求命中
+```
+
+#### 数据（SGLang 论文）
+
+| 场景 | 加速 |
+|---|---|
+| Multi-turn chat | **2-5x** |
+| Few-shot prompting（相同 system prompt） | **2-4x** |
+| Tree-of-Thought / Agent 场景 | **1.5-3x** |
+
+#### 工程支持
+
+| 框架 | 支持 |
+|---|---|
+| **SGLang** | 原生（首发） |
+| **vLLM** | ≥ 0.6，`--enable-prefix-caching` |
+| **TensorRT-LLM** | KV cache reuse |
+| **LMDeploy** | ✅ |
+
+---
+
+### 8.8 FP4 与 Blackwell
+
+B200 / GB200 引入 native FP4 TensorCore（Hopper 只有 FP8）。
+
+#### 精度表示
+
+```
+FP4 主流两种编码:
+  E2M1: 1 sign + 2 exponent + 1 mantissa
+        表示 16 个值, 动态范围 ~[0.5, 6.0]
+  E1M2: 1 sign + 1 exponent + 2 mantissa
+        动态范围窄, 精度略高
+
+Blackwell 硬件方案:
+  E2M1 TensorCore
+  + Micro-scaling (MXFP4, OCP 标准):
+      每 32 元素共享一个 exponent (E8M0)
+      提升有效动态范围, 缓解 FP4 表示能力不足
+```
+
+#### 数据
+
+| Precision | Peak TensorCore (B200) | Llama-70B 显存占用 |
+|---|---:|---:|
+| FP16 | 2250 TFLOPS | 140 GB |
+| FP8 (E4M3) | 4500 TFLOPS | 70 GB |
+| **FP4 (E2M1 / MXFP4)** | **9000 TFLOPS** | **35 GB** |
+
+**精度对齐**：FP4 单纯 PTQ 掉点 ~5-15%（论文报告，取决于任务），实用需 QAT 或结合 SmoothQuant / AWQ / GPTQ。
+
+#### 工程支持
+
+| 框架 | FP4 状态 |
+|---|---|
+| **TensorRT-LLM** | ≥ v0.14 alpha 支持 MXFP4 |
+| **vLLM** | 主干实验（2026-Q1） |
+| **NVIDIA NeMo** | 官方 FP4 QAT recipe |
+| **llama.cpp** | Q4 系列（非严格 MXFP4，但概念接近） |
+
+---
+
+### 8.9 前沿技术落地 checklist
+
+按改动范围排序：
+
+```
+仅换库调用 (0 架构改动):
+  □ FlashInfer attention backend      (Part 8.4)
+  □ FlashInfer sampling               (Part 8.5)
+  □ Prefix caching                    (Part 8.7)
+
+配置开关:
+  □ Chunked prefill                   (Part 7.6)
+  □ Continuous batching               (Part 7.4)
+  □ 量化到 FP8 / INT4 (AWQ/GPTQ)      (Part 6)
+
+架构改造:
+  □ P/D 分离                          (Part 8.1)
+  □ Speculative decoding:
+     - DeepSeek 生态 → MTP            (Part 8.2)
+     - 其他模型     → EAGLE-3         (Part 8.3)
+  □ MLA (需换模型或重训)              (Part 8.6)
+
+硬件:
+  □ H100 → H200: 显存 80→141 GB, 带宽 3.35→4.8 TB/s
+  □ H100 → B200: FP4 支持, 带宽 →8 TB/s   (Part 8.8)
+```
 
 ---
 
@@ -1702,8 +2057,10 @@ Q4 Kernel 效率: batch=24 attention 计算/IO 混合
 
 ---
 
-**文档版本**: v1.1 (2026-07-15)
-**变更**: 新增 Part 8 前沿探索（2025-2026），追踪 P/D 分离、MTP、EAGLE-3、FlashInfer、Sampling 重构等 18 个月内业界重大进展
+**文档版本**: v1.2 (2026-07-15)
+**变更**:
+- v1.2: Part 8 前沿探索重写，改为「原理（图/伪代码/公式）→ 数据 → 工程支持」结构，补充 DistServe M/D/1 公式、EAGLE Autoregression Head 参数量、FlashInfer BSR / JIT / Scheduler 三大机制、Dual Pivot Rejection Sampling 伪代码、MLA 数学表达等技术细节
+- v1.1: 新增 Part 8 前沿探索（2025-2026）
 **作者**: chenglitao (based on voice_safety P2.5 project)
 **License**: 内部资料，欢迎完善
 

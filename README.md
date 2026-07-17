@@ -14,7 +14,7 @@
 
 | 文档 | 内容概要 | 行数 |
 |---|---|---|
-| [`ml_inference_acceleration.md`](./ml_inference_acceleration.md) | 推理加速完整手册: 加速金字塔 5 层 · 图优化 L1-L6 · 6 大推理框架矩阵 · 量化家族 · LLM 专属优化 · **前沿探索 (P/D 分离 · MTP · EAGLE-3 · FlashInfer · Sampling 重构)** · 硬件视角 · 多卡并行 · 性能分析 · 面试题清单 · voice_safety 实战 | 1710 |
+| [`ml_inference_acceleration.md`](./ml_inference_acceleration.md) | 推理加速完整手册: 加速金字塔 5 层 · 图优化 L1-L6 · 6 大推理框架矩阵 · 量化家族 · LLM 专属优化 · **前沿探索 (P/D 分离 · MTP · EAGLE · FlashInfer · Sampling · MLA · RadixAttention · FP4)** · 硬件视角 · 多卡并行 · 性能分析 · 面试题清单 · voice_safety 实战 | 2066 |
 
 ### `ml_inference_acceleration.md` 章节速览
 
@@ -25,7 +25,15 @@
 5. **模型类型 × 推理方案选型**: encoder-only / decoder-only / encoder-decoder 各自的加速路径
 6. **量化技术家族**: PTQ / QAT / SmoothQuant / GPTQ / AWQ / KV-Cache 量化
 7. **LLM 推理专属优化**: KV-Cache / PagedAttention / Continuous Batching / Speculative Decoding / MoE 稀疏化
-8. **前沿探索 (2025-2026)** 🆕: P/D 分离 (DistServe/Splitwise/Mooncake) · MTP (DeepSeek-V3 模型自带推测解码) · EAGLE 三代演进 · FlashInfer (MLSys'25 Best Paper) · Sampling 算子重构 (sorting-free) · MLA · RadixAttention · FP4/Blackwell · 长上下文优化
+8. **前沿探索 (2025-2026)** 🆕: 每技术按「原理 → 数据 → 工程支持」组织
+   - **8.1 P/D 分离**: DistServe M/D/1 排队公式 · Mooncake 三级存储 · Layer-wise KV 传输 overlap · 4 大生产系统对比
+   - **8.2 MTP**: DeepSeek-V3 MTP 架构图 + loss 公式 · 85-90% 接受率 · 与 EAGLE 对比
+   - **8.3 EAGLE**: feature-level 自回归定义 · Autoregression Head 参数量表 · Tree Attention · SmoothL1 + CE loss · 三代差异
+   - **8.4 FlashInfer**: BSR 布局 · JIT template functor · Load-balanced scheduler (Stream-K 灵感)
+   - **8.5 Sampling 重构**: 传统 sort-based O(V log V) 瓶颈 · Dual Pivot Rejection Sampling 伪代码
+   - **8.6 MLA**: latent 维度数学表达 · KV cache 压缩 93%
+   - **8.7 RadixAttention**: 跨请求 prefix radix tree
+   - **8.8 FP4 / Blackwell**: MXFP4 微缩放 · 精度对齐挑战
 9. **硬件视角**: NVIDIA GPU 代际差异 / TPU / IPU / 国产芯片 (Habana/寒武纪/华为昇腾)
 10. **多卡并行推理**: TP / PP / EP / DP 组合策略
 11. **性能分析实战**: Nsight / nvprof / TensorBoard / PyTorch Profiler 使用要点
@@ -52,6 +60,7 @@
 
 ## 版本历史
 
+- **v1.2** (2026-07-15): Part 8 前沿探索重写。每技术改为「原理（图/伪代码/公式）→ 数据 → 工程支持」结构，补充 DistServe M/D/1 公式、EAGLE 参数量表、FlashInfer BSR/JIT/Scheduler 三大机制、Dual Pivot Rejection Sampling 伪代码、MLA 数学表达等技术细节
 - **v1.1** (2026-07-15): 新增 Part 8 前沿探索 —— P/D 分离、MTP、EAGLE-3、FlashInfer、Sampling 重构
 - **v1.0** (2026-07-15): 初始版本，Part 1-13 完整手册（现 Part 1-7 + Part 9-14）
 
